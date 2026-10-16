@@ -1,0 +1,7 @@
+# containerlab runtime state (contains local paths and owner)
+clab-*/
+.clab*.bak
+*.pcap
+*.log
+__pycache__/
+results/
