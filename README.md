@@ -123,12 +123,12 @@ When RCN binds, the window is capped before the queue reaches the RED threshold,
 
 ### Multipath
 
-Flows spread over the spines only when the window needs them. Having 8 flows per QP does not mean all 4 spines carry data.
+Having 8 flows per QP does not mean all 4 spines carry data. The spec adds flows as the rate, and so the window, grows (§7.4.2), and moves window from congested flows to uncongested ones (§6.1.2). With the short RTTs in this lab, a few packets of window are enough, so one flow carries the traffic on an idle fabric. The traffic spread only when a path became congested.
 
 - 1:1 unshaped and 3:1 incast: each sender used almost only one spine. The bottleneck is the software or the downlink to h8, so extra paths do not help.
 - h1→h7 and h2→h8 at the same time, both from leaf1: when both senders hashed onto a shared uplink, the traffic from leaf1 spread over three spines and the congested uplink marked ECN. In 2 of 3 runs the two senders happened to take different spines and each stayed on one.
 
-The spec leaves the policy for adding and removing flows to the implementation (§7.4). libsoftmetaroce sends a fast-start burst on each flow, then grows the window only on flows whose RTT is at or below the smoothed QP RTT and shrinks it on flows that see ECN marks.
+This matches the spec. §7.4.2 recommends activating another flow when `average_window × (active_flow_count + 1) < QWND`. §6.1.2 reduces only the congested flow's `FWND`, and requires that a flow with higher-than-usual RTT can skip a window increase so that another flow claims it. libsoftmetaroce sends a fast-start burst on each flow, then grows the window only on flows whose RTT is at or below the smoothed QP RTT and shrinks it on flows that see ECN marks.
 
 A capture on h1 showed 6 data source ports, most traffic on 2 of them. They step by 2 because each flow gets a data socket and an ACK socket. The ACKs used other source ports at a constant offset, but the offset is not computed from the data port: the receiver sends the ACKs for each flow ID from its own fixed socket. When the sender repaths a flow after repeated RTOs, the ACK path stays the same, which differs from the recommendation in spec §7.1.1 (metaroce `6c5a3a4`, found by reading the source, not observed in a repath).
 
@@ -266,12 +266,12 @@ RCN が効くと、キューが RED の閾値に達する前に窓が抑えら�
 
 ### マルチパス
 
-フローがスパインに分散するのは、窓がそれを必要とするときだけです。QP あたり 8 本のフローがあっても、4 台のスパインすべてにデータが流れるわけではありません。
+QP あたり 8 本のフローがあっても、4 台のスパインすべてにデータが流れるわけではありません。仕様では、フローはレートが上がって窓が大きくなるにつれて増やし（§7.4.2）、混んだフローの窓は減らして空いているフローに回します（§6.1.2）。RTT の短いこのラボでは窓が数パケットで足りるので、空いているときは 1 フローで十分です。トラフィックが広がったのは、経路が混んだときだけでした。
 
 - 1 対 1（制限なし）と 3 対 1 の incast: 各送信者は、ほぼ 1 台のスパインしか使いませんでした。ボトルネックがソフト実装や h8 への下りにあるので、経路を増やしても速くなりません。
 - h1→h7 と h2→h8 を同時に流した場合（どちらも leaf1 から送信）: 2 台の送信が同じ上りに乗ると、leaf1 からのトラフィックは 3 台のスパインに分かれ、混んだ上りで ECN マークが付きました。3 回のうち 2 回は、2 台がたまたま別のスパインを通り、それぞれ 1 台のままでした。
 
-フローをいつ増やし、いつ減らすかは、仕様では実装に任されています（§7.4）。libsoftmetaroce は、まず fast start で各フローに少しずつ送り、その後は RTT が QP の平滑化 RTT 以下のフローだけ窓を増やし、ECN マークを受けたフローの窓を減らします。
+これは仕様どおりの動作です。§7.4.2 は、`average_window × (active_flow_count + 1) < QWND` のときにフローを 1 本増やすことを推奨しています。§6.1.2 は、混んだフローの `FWND` だけを減らし、RTT がふだんより大きいフローは窓の増分を見送って別のフローに回せることを必須としています。libsoftmetaroce は、まず fast start で各フローに少しずつ送り、その後は RTT が QP の平滑化 RTT 以下のフローだけ窓を増やし、ECN マークを受けたフローの窓を減らします。
 
 h1 でパケットを取ると、データの送信元ポートは 6 種類あり、大半は 2 種類に集中していました。ポートが 2 ずつずれるのは、フローごとにデータ用と ACK 用のソケットを対で作るためです。ACK は一定の差がある別のポートを使っていましたが、この差はデータのポートから計算した値ではありません。受信側はフロー番号ごとに自分の固定のソケットから ACK を返しています。そのため、送信側が RTO を繰り返して経路を変えても、ACK の経路は変わりません。これは仕様 §7.1.1 の推奨と異なります（metaroce `6c5a3a4`。ソースを読んで分かったことで、経路の切り替えを実際に観察したわけではありません）。
 
