@@ -71,6 +71,11 @@ MSGS=100 scripts/run-write.sh h8 h1,h3,h5        # 3:1 incast
 PLANES=1,2 MSGS=100 scripts/run-write.sh h8 h1,h3,h5   # incast over both planes (multi-port QP)
 scripts/fabric-qos.sh show                       # ECN marks / drops per port
 
+# 5. link failure, while a transfer is running (see "Link failure")
+scripts/uplink-watch.sh p1-leaf1 p1-leaf4        # packets/s on each uplink
+scripts/fail-link.sh down p1-leaf1 eth2          # link down; undo with 'up'
+scripts/fail-link.sh blackhole p1-spine2 eth4    # drop UDP 2766 silently; undo with 'clear'
+
 # teardown
 containerlab destroy -t metaroce.clab.yml --cleanup
 ```
@@ -95,7 +100,9 @@ The repository is cloned into the current directory, and the helper scripts are 
 | `metaroce.clab.yml`, `configs/` | Generated output, committed for the default size |
 | `scripts/fabric-qos.sh` | Uses HTB shaping plus RED with ECN marking on all leaf and spine ports |
 | `scripts/ecmp-stats.sh` | Shows TX deltas on each leaf uplink, so you can see how traffic spreads over the spines |
-| `scripts/run-write.sh` | Starts an `rdma_gen` server and one or more clients, then prints each client's throughput. Result JSON goes to `results/` |
+| `scripts/run-write.sh` | Starts an `rdma_gen` server and one or more clients, then prints each client's throughput and any failed work completions. Result JSON goes to `results/` |
+| `scripts/fail-link.sh` | Takes a fabric link down, or silently drops MetaRoCE packets (UDP 2766) on a port while the link and BGP stay up |
+| `scripts/uplink-watch.sh` | Prints packets per second on each spine-facing port of the given leaves |
 
 ## Example results
 
@@ -130,7 +137,36 @@ Having 8 flows per QP does not mean all 4 spines carry data. The spec adds flows
 
 This matches the spec. §7.4.2 recommends activating another flow when `average_window × (active_flow_count + 1) < QWND`. §6.1.2 reduces only the congested flow's `FWND`, and requires that a flow with higher-than-usual RTT can skip a window increase so that another flow claims it. libsoftmetaroce sends a fast-start burst on each flow, then grows the window only on flows whose RTT is at or below the smoothed QP RTT and shrinks it on flows that see ECN marks.
 
-A capture on h1 showed 6 data source ports, most traffic on 2 of them. They step by 2 because each flow gets a data socket and an ACK socket. The ACKs used other source ports at a constant offset, but the offset is not computed from the data port: the receiver sends the ACKs for each flow ID from its own fixed socket. When the sender repaths a flow after repeated RTOs, the ACK path stays the same, which differs from the recommendation in spec §7.1.1 (metaroce `6c5a3a4`, found by reading the source, not observed in a repath).
+A capture on h1 showed 6 data source ports, most traffic on 2 of them. They step by 2 because each flow gets a data socket and an ACK socket. The ACKs used other source ports at a constant offset, but the offset is not computed from the data port: the receiver sends the ACKs for each flow ID from its own fixed socket. When the sender repaths a flow after repeated RTOs, the ACK path stays the same, which differs from the recommendation in spec §7.1.1 (metaroce `6c5a3a4`). The link failure tests below show the effect.
+
+### Link failure
+
+A 1:1 transfer (h1→h8, 2000 × 1 MiB, unshaped) runs while one path fails 4 s after the start. `uplink-watch.sh` shows packets per second on the uplinks of leaf1 (data) and leaf4 (ACKs). Three failure types, 3 runs each:
+
+| Failure | How | Result |
+|---|---|---|
+| Link down | `fail-link.sh down p1-leaf1 ethN` on the uplink carrying data | Completed 3/3 (1.24–1.48 Gbit/s). The kernel removes the nexthop at once and traffic moves to the other spines within 1 s |
+| Silent drop, forward path | `fail-link.sh blackhole p1-spineN eth4` on the spine carrying data. The link and BGP stay up | Completed 3/3 (1.27–1.46 Gbit/s). Data moved to another spine within about 1 s; 16–54 packets were dropped |
+| Silent drop, return path | `fail-link.sh blackhole p1-spineN eth1` on the spine carrying ACKs | Failed 3/3. The sender retransmits on other spines, but the ACKs keep taking the dropping spine. After 8.6 s without ACK progress the watchdog fails the QP |
+
+Return-path drop, second run (columns are packets per second to spine1/2/3/4):
+
+```text
+22:53:08 p1-leaf1:2/2/3/38873 p1-leaf4:1/2/2/27011   <- data and ACKs on spine4
+22:53:09 p1-leaf1:33/62/151/16183 p1-leaf4:3/3/3/9025 <- ACKs dropped on spine4 -> leaf1
+22:53:10 p1-leaf1:32/3/1/3 p1-leaf4:1/2/2/24          <- retransmits on spine1, ACKs still to spine4
+22:53:11 p1-leaf1:2/32/2/2 p1-leaf4:1/2/2/3           <- retransmits on spine2
+22:53:13 p1-leaf1:3/4/31/4 p1-leaf4:1/3/2/3           <- retransmits on spine3
+```
+
+```text
+E... Qp.cpp:1365] Watchdog expired for qp: 2. No progress (ACKs) for 8590ms
+E... RdmaGenRequester.cpp:280] ... failed with ibv_wc_status code: 12 [transport retry counter exceeded]
+```
+
+The data side repaths as specified: after `--libsoftmetaroce_rtos_before_repath` (default 2) RTOs it moves the flow to another source port. The receiver, however, sends the ACKs for each flow ID from a fixed socket, so the ACK path never changes and the failure on the return path cannot be avoided. Spec §7.1.1 asks for the ACK source port to change when the data source port changes, exactly so that a repath also escapes a fault on the return path. In the third run, one flow's ACKs took a different spine and kept the transfer going for a few seconds before it also stalled, and the client crashed with SIGSEGV in `Qp::processWatchdogExpiryAsync`.
+
+`rdma_gen` counts failed work completions as messages and still prints a throughput. `run-write.sh` therefore also counts `failed with ibv_wc_status` lines in the client log, prints them as `FAILED: N work completions`, and exits with status 1.
 
 ## Notes
 
@@ -214,6 +250,11 @@ MSGS=100 scripts/run-write.sh h8 h1,h3,h5        # 3 対 1 の incast
 PLANES=1,2 MSGS=100 scripts/run-write.sh h8 h1,h3,h5   # 両プレーンを使う incast（マルチポート QP）
 scripts/fabric-qos.sh show                       # ポートごとの ECN マーク数と廃棄数
 
+# 5. リンク断（転送中に実行する。「リンク断」の節を参照）
+scripts/uplink-watch.sh p1-leaf1 p1-leaf4        # 上りポートごとの毎秒のパケット数
+scripts/fail-link.sh down p1-leaf1 eth2          # リンクダウン。戻すときは up
+scripts/fail-link.sh blackhole p1-spine2 eth4    # UDP 2766 を黙って捨てる。戻すときは clear
+
 # 片付け
 containerlab destroy -t metaroce.clab.yml --cleanup
 ```
@@ -238,7 +279,9 @@ containerlab deploy -t https://github.com/nanakanok/clab-metaroce
 | `metaroce.clab.yml`, `configs/` | 生成物。既定の規模の分を commit している |
 | `scripts/fabric-qos.sh` | リーフとスパインの全ポートに、HTB による帯域制限と RED による ECN マークをかける |
 | `scripts/ecmp-stats.sh` | 各リーフの上りポートの送信差分を表示し、スパインへの分散具合を見る |
-| `scripts/run-write.sh` | `rdma_gen` のサーバと 1 台以上のクライアントを起動し、クライアントごとのスループットを表示する。結果の JSON は `results/` に保存 |
+| `scripts/run-write.sh` | `rdma_gen` のサーバと 1 台以上のクライアントを起動し、クライアントごとのスループットと、エラーになった完了の数を表示する。結果の JSON は `results/` に保存 |
+| `scripts/fail-link.sh` | ファブリックのリンクを落とす。または、リンクと BGP は up のまま、ポートで MetaRoCE のパケット（UDP 2766）を黙って捨てる |
+| `scripts/uplink-watch.sh` | 指定したリーフの、スパイン向けポートごとの毎秒のパケット数を表示する |
 
 ## 測定例
 
@@ -273,7 +316,36 @@ QP あたり 8 本のフローがあっても、4 台のスパインすべてに
 
 これは仕様どおりの動作です。§7.4.2 は、`average_window × (active_flow_count + 1) < QWND` のときにフローを 1 本増やすことを推奨しています。§6.1.2 は、混んだフローの `FWND` だけを減らし、RTT がふだんより大きいフローは窓の増分を見送って別のフローに回せることを必須としています。libsoftmetaroce は、まず fast start で各フローに少しずつ送り、その後は RTT が QP の平滑化 RTT 以下のフローだけ窓を増やし、ECN マークを受けたフローの窓を減らします。
 
-h1 でパケットを取ると、データの送信元ポートは 6 種類あり、大半は 2 種類に集中していました。ポートが 2 ずつずれるのは、フローごとにデータ用と ACK 用のソケットを対で作るためです。ACK は一定の差がある別のポートを使っていましたが、この差はデータのポートから計算した値ではありません。受信側はフロー番号ごとに自分の固定のソケットから ACK を返しています。そのため、送信側が RTO を繰り返して経路を変えても、ACK の経路は変わりません。これは仕様 §7.1.1 の推奨と異なります（metaroce `6c5a3a4`。ソースを読んで分かったことで、経路の切り替えを実際に観察したわけではありません）。
+h1 でパケットを取ると、データの送信元ポートは 6 種類あり、大半は 2 種類に集中していました。ポートが 2 ずつずれるのは、フローごとにデータ用と ACK 用のソケットを対で作るためです。ACK は一定の差がある別のポートを使っていましたが、この差はデータのポートから計算した値ではありません。受信側はフロー番号ごとに自分の固定のソケットから ACK を返しています。そのため、送信側が RTO を繰り返して経路を変えても、ACK の経路は変わりません。これは仕様 §7.1.1 の推奨と異なります（metaroce `6c5a3a4`）。その影響は、次のリンク断の試験で確かめました。
+
+### リンク断
+
+1 対 1 の転送（h1→h8、1 MiB を 2000 回、帯域制限なし）を流し、開始 4 秒後に経路を 1 本壊します。`uplink-watch.sh` で、leaf1（データ）と leaf4（ACK）の上りポートの毎秒のパケット数を見ます。障害は 3 種類で、それぞれ 3 回試しました。
+
+| 障害 | 方法 | 結果 |
+|---|---|---|
+| リンクダウン | データが通る上りポートで `fail-link.sh down p1-leaf1 ethN` | 3 回とも完了（1.24〜1.48 Gbit/s）。カーネルがすぐにネクストホップを消し、1 秒以内に残りのスパインへ移った |
+| 往路のサイレント破棄 | データが通るスパインで `fail-link.sh blackhole p1-spineN eth4`。リンクと BGP は up のまま | 3 回とも完了（1.27〜1.46 Gbit/s）。約 1 秒で別のスパインに移り、捨てられたのは 16〜54 パケット |
+| 復路のサイレント破棄 | ACK が通るスパインで `fail-link.sh blackhole p1-spineN eth1` | 3 回とも失敗。送信側は別のスパインで再送するが、ACK は破棄するスパインを通り続ける。ACK が 8.6 秒進まず、watchdog が QP をエラーにした |
+
+復路のサイレント破棄の 2 回目（列はスパイン 1/2/3/4 への毎秒のパケット数）:
+
+```text
+22:53:08 p1-leaf1:2/2/3/38873 p1-leaf4:1/2/2/27011   <- データも ACK も spine4
+22:53:09 p1-leaf1:33/62/151/16183 p1-leaf4:3/3/3/9025 <- spine4 -> leaf1 で ACK を破棄
+22:53:10 p1-leaf1:32/3/1/3 p1-leaf4:1/2/2/24          <- spine1 で再送。ACK は spine4 のまま
+22:53:11 p1-leaf1:2/32/2/2 p1-leaf4:1/2/2/3           <- spine2 で再送
+22:53:13 p1-leaf1:3/4/31/4 p1-leaf4:1/3/2/3           <- spine3 で再送
+```
+
+```text
+E... Qp.cpp:1365] Watchdog expired for qp: 2. No progress (ACKs) for 8590ms
+E... RdmaGenRequester.cpp:280] ... failed with ibv_wc_status code: 12 [transport retry counter exceeded]
+```
+
+データ側は仕様どおりに経路を変えています。RTO が `--libsoftmetaroce_rtos_before_repath`（既定 2）回続くと、そのフローを別の送信元ポートに移します。しかし受信側は、フロー番号ごとに固定のソケットから ACK を返すので、ACK の経路は変わらず、復路の障害を避けられません。仕様 §7.1.1 が「データの送信元ポートが変わったら ACK の送信元ポートも変える」ことを求めているのは、まさに経路の切り替えで復路の障害も避けるためです。3 回目は、1 つのフローの ACK が別のスパインを通っていたので数秒は転送が続きましたが、やがて止まり、クライアントは `Qp::processWatchdogExpiryAsync` で SIGSEGV を起こしました。
+
+`rdma_gen` はエラーになった完了も 1 メッセージとして数え、スループットも表示します。そこで `run-write.sh` は、クライアントのログにある `failed with ibv_wc_status` の行数を数えて `FAILED: N work completions` と表示し、終了コード 1 で終わるようにしました。
 
 ## 注意点
 

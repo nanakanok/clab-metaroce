@@ -51,11 +51,16 @@ docker exec "clab-$LAB-$SRV" pkill -x rdma_gen || true
 
 for c in ${CLIS//,/ }; do
   docker cp -q "clab-$LAB-$c:/tmp/rdma_gen-$ts.json" "$OUT/$ts-$c.json" 2>/dev/null || { echo "$c: no result"; rc=1; continue; }
-  python3 - "$OUT/$ts-$c.json" "$c" <<'EOF'
+  # rdma_gen counts failed work completions as messages, so report them separately.
+  failed=$(docker exec "clab-$LAB-$c" grep -c 'failed with ibv_wc_status' /tmp/rdma_gen-client.log || true)
+  python3 - "$OUT/$ts-$c.json" "$c" "${failed:-0}" <<'EOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
 r = (d[-1] if isinstance(d, list) else d)["results"]
-print(f"{sys.argv[2]}: {sum(r['total_messages'])} msgs  {r['Gbps']:.3f} Gbps")
+failed = int(sys.argv[3])
+note = f"  FAILED: {failed} work completions with error status" if failed else ""
+print(f"{sys.argv[2]}: {sum(r['total_messages'])} msgs  {r['Gbps']:.3f} Gbps{note}")
 EOF
+  [ "${failed:-0}" -eq 0 ] || rc=1
 done
 exit $rc
