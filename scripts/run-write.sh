@@ -7,7 +7,9 @@
 #   CC=baseline_rcn  congestion control (--libsoftmetaroce_cc_algorithm) default: library default
 #   MSGS=300         messages per client                              default 300
 #   SIZE=1048576     message size in bytes                            default 1MiB
-#   NIC_GBPS=1       rate hint for receiver-driven CC                  default 1
+#   NIC_GBPS=10      NIC rate for the receiver-driven CC (RCN) hint    default 10 (library default)
+#                    Integer Gbit/s. The receiver advertises ceil(NIC_GBPS / active receiving QPs)
+#                    per QP, so the smallest hint is 1 Gbit/s; it cannot cap below that.
 #   EXTRA="..."      extra rdma_gen flags for both sides
 # Note: rdma_gen's --tx_path_count is not used by libsoftmetaroce; flows come from --libsoftmetaroce_txflows.
 # Example: PLANES=1,2 FLOWS=4 scripts/run-write.sh h8 h1,h2,h3   (incast to h8)
@@ -15,7 +17,7 @@ set -eu
 LAB=${LAB:-metaroce}
 SRV=$1; CLIS=$2
 PLANES=${PLANES:-1}; FLOWS=${FLOWS:-8}; CC=${CC:-}; MSGS=${MSGS:-300}; SIZE=${SIZE:-1048576}
-NIC_GBPS=${NIC_GBPS:-1}; EXTRA=${EXTRA:-}
+NIC_GBPS=${NIC_GBPS:-10}; EXTRA=${EXTRA:-}
 OUT=${OUT:-results}; mkdir -p "$OUT"
 ts=$(date +%Y%m%d-%H%M%S)
 

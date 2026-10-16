@@ -46,7 +46,7 @@ It is not for measuring line-rate performance.
 | Hosts | 2 per leaf. Each host has one NIC per plane: `eth1` connects to plane 1, `eth2` to plane 2 |
 | Addressing (IPv6 only) | host *i* on leaf *l*, plane *p* = `fd00:p:l:i::10/64`, gateway `::1`. Host h1 = `fd00:1:1:1::10` / `fd00:2:1:1::10` |
 | Plane isolation | Planes do not route to each other (`fd00:1::/32` is plane 1 only, `fd00:2::/32` is plane 2 only) |
-| ECMP hashing | `net.ipv6.fib_multipath_hash_policy=1` (L4 5-tuple). MetaRoCE carries its entropy in the UDP source port, so each flow takes a different spine |
+| ECMP hashing | `net.ipv6.fib_multipath_hash_policy=1` (L4 5-tuple). MetaRoCE carries its entropy in the UDP source port, so different flows can take different spines |
 | MTU | 9000 |
 
 You can change the scale with `./gen.py --planes 2 --spines 4 --leaves 4 --hosts-per-leaf 2`. It regenerates `metaroce.clab.yml` and `configs/`.
@@ -99,15 +99,38 @@ The repository is cloned into the current directory, and the helper scripts are 
 
 ## Example results
 
-These were measured with the default topology, every fabric port shaped to 300 Mbit/s and RED ECN enabled (`min=60KB`, `max=180KB`). Each client sends 1 MiB WRITE messages, with 8 MetaRoCE flows per QP.
+Conditions: default topology, 1 MiB WRITE messages, 8 MetaRoCE flows per QP, `NIC_GBPS=10` (the `run-write.sh` default). Each value is the median of 3 runs. The fabric was either shaped to 300 Mbit/s with RED ECN (`min=60KB`, `max=180KB`) or left unshaped.
 
-| Scenario | Per-client throughput | What it shows |
+| Scenario (sum over clients) | 300 Mbit/s | Unshaped |
 |---|---|---|
-| 3:1 incast, plane 1 | about 0.10 Gbit/s each (sum ≈ 0.3) | Fair sharing of the bottleneck link to h8. The leaf downlink marked about 28k packets with ECN and dropped fewer than 10 |
-| 3:1 incast, planes 1+2 | about 0.20 Gbit/s each (sum ≈ 0.6) | One multi-port QP stripes traffic across both planes, so aggregate throughput doubles. Both planes mark ECN |
-| 1:1, unshaped | about 1.1 Gbit/s | Ceiling of the software transport with a single sender thread on this kind of host |
+| 1:1 (h1→h8) | 0.29 Gbit/s | 1.29 Gbit/s |
+| 3:1 incast (h1,h3,h5→h8), plane 1 | 0.30 Gbit/s | 1.64 Gbit/s |
+| 3:1 incast, planes 1+2 | 0.59 Gbit/s | 1.77 Gbit/s |
 
-Flows spread over the spines only when the window needs them. With an idle fabric, two flows were enough to carry the traffic and only two spines carried data. Under congestion, all four spines were used.
+- At 300 Mbit/s the link is the bottleneck. The three incast senders share the downlink to h8 about equally, and the leaf downlink to h8 marked about 25k packets with ECN while dropping only a few. One multi-port QP stripes across both planes, so the sum doubles.
+- Unshaped, the software transport is the bottleneck: about 1.3 Gbit/s for 1:1, and using both planes barely raises the sum.
+
+### Receiver-driven rate limiting (RCN)
+
+The receiver advertises `ceil(NIC_GBPS / active receiving QPs)` per QP, in whole Gbit/s, so the hint is never below 1 Gbit/s and does not bind on a 300 Mbit/s fabric. There, fair sharing comes from ECN-driven AIMD. With the fabric shaped to 3 Gbit/s (3:1 incast, median of 3 runs):
+
+| `NIC_GBPS` | Hint per QP | Sum of throughput | ECN marks on the downlink to h8 |
+|---|---|---|---|
+| 3 | 1 Gbit/s (equal to the fair share) | 1.45 Gbit/s | 0 / 0 / 0 |
+| 10 | 4 Gbit/s (does not bind) | 1.60 Gbit/s | 207 / 257 / 413 |
+
+When RCN binds, the window is capped before the queue reaches the RED threshold, so no packets were marked. A small `NIC_GBPS` silently caps each QP, which is why `run-write.sh` uses the library default of 10.
+
+### Multipath
+
+Flows spread over the spines only when the window needs them. Having 8 flows per QP does not mean all 4 spines carry data.
+
+- 1:1 unshaped and 3:1 incast: each sender used almost only one spine. The bottleneck is the software or the downlink to h8, so extra paths do not help.
+- h1→h7 and h2→h8 at the same time, both from leaf1: when both senders hashed onto a shared uplink, the traffic from leaf1 spread over three spines and the congested uplink marked ECN. In 2 of 3 runs the two senders happened to take different spines and each stayed on one.
+
+The spec leaves the policy for adding and removing flows to the implementation (§7.4). libsoftmetaroce sends a fast-start burst on each flow, then grows the window only on flows whose RTT is at or below the smoothed QP RTT and shrinks it on flows that see ECN marks.
+
+A capture on h1 showed 6 data source ports, most traffic on 2 of them. They step by 2 because each flow gets a data socket and an ACK socket. The ACKs used other source ports at a constant offset, but the offset is not computed from the data port: the receiver sends the ACKs for each flow ID from its own fixed socket. When the sender repaths a flow after repeated RTOs, the ACK path stays the same, which differs from the recommendation in spec §7.1.1 (metaroce `6c5a3a4`, found by reading the source, not observed in a repath).
 
 ## Notes
 
@@ -166,7 +189,7 @@ If you redistribute a built image, include their LICENSE and NOTICE files.
 | ホスト | リーフあたり 2 台。各ホストはプレーンごとに NIC を 1 つ持つ（`eth1` がプレーン 1、`eth2` がプレーン 2） |
 | アドレス（IPv6 のみ） | プレーン *p*・リーフ *l* の *i* 番目のホスト = `fd00:p:l:i::10/64`、ゲートウェイは `::1`。h1 は `fd00:1:1:1::10` / `fd00:2:1:1::10` |
 | プレーンの分離 | プレーン間はルーティングしない（`fd00:1::/32` はプレーン 1 だけ、`fd00:2::/32` はプレーン 2 だけ） |
-| ECMP ハッシュ | `net.ipv6.fib_multipath_hash_policy=1`（L4 の 5-tuple）。MetaRoCE はエントロピーを UDP 送信元ポートに入れるので、フローごとに別のスパインを通る |
+| ECMP ハッシュ | `net.ipv6.fib_multipath_hash_policy=1`（L4 の 5-tuple）。MetaRoCE はエントロピーを UDP 送信元ポートに入れるので、フローごとに別のスパインを通りうる |
 | MTU | 9000 |
 
 規模は `./gen.py --planes 2 --spines 4 --leaves 4 --hosts-per-leaf 2` で変えられます。`metaroce.clab.yml` と `configs/` を作り直します。
@@ -219,15 +242,38 @@ containerlab deploy -t https://github.com/nanakanok/clab-metaroce
 
 ## 測定例
 
-既定のトポロジで、ファブリックの全ポートを 300 Mbit/s に制限し、RED の ECN を有効にして測りました（`min=60KB`、`max=180KB`）。各クライアントは 1 MiB の WRITE を送り、QP あたりの MetaRoCE フローは 8 本です。
+条件: 既定のトポロジ、1 MiB の WRITE、QP あたり 8 フロー、`NIC_GBPS=10`（`run-write.sh` の既定値）。値は 3 回の中央値です。ファブリックは、300 Mbit/s に制限して RED の ECN を有効にした場合（`min=60KB`、`max=180KB`）と、制限なしの場合で測りました。
 
-| シナリオ | クライアントあたりのスループット | わかること |
+| シナリオ（全クライアントの合計） | 300 Mbit/s | 制限なし |
 |---|---|---|
-| 3 対 1 の incast、プレーン 1 | 各約 0.10 Gbit/s（合計 ≈ 0.3） | h8 へのボトルネックを公平に分け合う。リーフの下りポートで約 2.8 万パケットに ECN マークが付き、廃棄は 10 個未満 |
-| 3 対 1 の incast、プレーン 1+2 | 各約 0.20 Gbit/s（合計 ≈ 0.6） | 1 つのマルチポート QP が両プレーンに振り分けて送るので、合計スループットが 2 倍になる。両プレーンで ECN マークが付く |
-| 1 対 1、帯域制限なし | 約 1.1 Gbit/s | この種のホストで、送信スレッド 1 本のソフト実装が出せる上限 |
+| 1 対 1（h1→h8） | 0.29 Gbit/s | 1.29 Gbit/s |
+| 3 対 1 の incast（h1,h3,h5→h8）、プレーン 1 | 0.30 Gbit/s | 1.64 Gbit/s |
+| 3 対 1 の incast、プレーン 1+2 | 0.59 Gbit/s | 1.77 Gbit/s |
 
-フローがスパインに分散するのは、窓がそれを必要とするときだけです。ファブリックが空いているときは 2 本のフローで足り、データを運んだスパインも 2 台だけでした。輻輳時は 4 台すべてを使いました。
+- 300 Mbit/s では、ボトルネックはリンクです。incast の 3 台は h8 への下りをほぼ均等に分け合い、その下りポートでは約 2.5 万パケットに ECN マークが付いた一方、廃棄はわずかでした。1 つのマルチポート QP が両プレーンに振り分けて送るので、合計は 2 倍になります。
+- 制限なしでは、ボトルネックはソフト実装です。1 対 1 は約 1.3 Gbit/s で、両プレーンを使っても合計はほとんど増えません。
+
+### 受信側主導のレート制御（RCN）
+
+受信側は QP ごとに `ceil(NIC_GBPS ÷ 受信中の QP 数)` のレートを整数の Gbit/s で知らせます。そのため目標レートは 1 Gbit/s を下回らず、300 Mbit/s のファブリックでは上限として働きません。そこでの公平な分け合いは、ECN による AIMD の働きです。ファブリックを 3 Gbit/s に制限した場合の結果です（3 対 1 の incast、3 回の中央値）。
+
+| `NIC_GBPS` | QP あたりの目標レート | 合計スループット | h8 への下りの ECN マーク |
+|---|---|---|---|
+| 3 | 1 Gbit/s（公平な取り分と同じ） | 1.45 Gbit/s | 0 / 0 / 0 |
+| 10 | 4 Gbit/s（上限として働かない） | 1.60 Gbit/s | 207 / 257 / 413 |
+
+RCN が効くと、キューが RED の閾値に達する前に窓が抑えられるので、ECN マークは一度も付きませんでした。`NIC_GBPS` を小さくすると知らないうちに QP ごとの上限がかかるので、`run-write.sh` はライブラリの既定値 10 を使います。
+
+### マルチパス
+
+フローがスパインに分散するのは、窓がそれを必要とするときだけです。QP あたり 8 本のフローがあっても、4 台のスパインすべてにデータが流れるわけではありません。
+
+- 1 対 1（制限なし）と 3 対 1 の incast: 各送信者は、ほぼ 1 台のスパインしか使いませんでした。ボトルネックがソフト実装や h8 への下りにあるので、経路を増やしても速くなりません。
+- h1→h7 と h2→h8 を同時に流した場合（どちらも leaf1 から送信）: 2 台の送信が同じ上りに乗ると、leaf1 からのトラフィックは 3 台のスパインに分かれ、混んだ上りで ECN マークが付きました。3 回のうち 2 回は、2 台がたまたま別のスパインを通り、それぞれ 1 台のままでした。
+
+フローをいつ増やし、いつ減らすかは、仕様では実装に任されています（§7.4）。libsoftmetaroce は、まず fast start で各フローに少しずつ送り、その後は RTT が QP の平滑化 RTT 以下のフローだけ窓を増やし、ECN マークを受けたフローの窓を減らします。
+
+h1 でパケットを取ると、データの送信元ポートは 6 種類あり、大半は 2 種類に集中していました。ポートが 2 ずつずれるのは、フローごとにデータ用と ACK 用のソケットを対で作るためです。ACK は一定の差がある別のポートを使っていましたが、この差はデータのポートから計算した値ではありません。受信側はフロー番号ごとに自分の固定のソケットから ACK を返しています。そのため、送信側が RTO を繰り返して経路を変えても、ACK の経路は変わりません。これは仕様 §7.1.1 の推奨と異なります（metaroce `6c5a3a4`。ソースを読んで分かったことで、経路の切り替えを実際に観察したわけではありません）。
 
 ## 注意点
 
